@@ -1,6 +1,9 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -12,6 +15,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/DenseSet.h"
 
 namespace mlir {
 namespace triton {
@@ -216,6 +220,28 @@ FailureOr<Value> createBufferStateMask(ImplicitLocOpBuilder &b,
     result = arith::OrIOp::create(b, result, candidate);
   }
   return result;
+}
+
+FailureOr<Value> createStaticBufferStateMask(
+    ImplicitLocOpBuilder &b, AuxDataMap &auxData,
+    const MemEffectsOpInfo::Effects::StaticSharedBuffer &buffer,
+    Operation *op) {
+  int index = static_cast<int>(MemType::SHARED_MEM);
+  const auto &regions = auxData.bufferRegions[index];
+  BufferRegion region = buffer.getRegion(ttg::lookupNumCTAs(op));
+  auto it = llvm::lower_bound(regions, region);
+  if (it == regions.end() || !(*it == region)) {
+    op->emitError("static shared-memory region is absent from the ConSan "
+                  "registry");
+    return failure();
+  }
+  unsigned id = std::distance(regions.begin(), it);
+  const BufferStatePlan &plan = auxData.bufferStatePlans[index];
+  auto writeVisibilityType =
+      cast<RankedTensorType>(auxData.writeVisibility[index].at(op).type);
+  RankedTensorType maskType =
+      tti::getSlicedTensorType(writeVisibilityType, {1}, b.getI1Type());
+  return createStateMaskConstant(b, maskType, plan.regionMasks[id]);
 }
 
 Value allCTAsMask(ImplicitLocOpBuilder &b) {
@@ -593,6 +619,38 @@ Value getLocalLoadStoreRecipientCTAs(ImplicitLocOpBuilder &b,
       b, getLocalLoadStoreConversion(memDescTy, regTy));
 }
 
+Value getScratchEffectCTAs(ImplicitLocOpBuilder &b, Operation *op,
+                           const ConSanTargetHooks &hooks) {
+  if (isa<CallOpInterface>(op)) {
+    // Non-entry validation ensures every scratch operation in the callee and
+    // its nested callees accesses only the issuing CTA's virtual frame.
+    return currentCTAMask(b);
+  }
+
+  if (auto convert = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+    // Conversion stores remain CTA-local, but the source-owned scratch may be
+    // read by other CTAs when the source and destination block layouts differ.
+    LinearLayout srcLayout = ttg::toLinearLayout(convert.getSrc().getType());
+    LinearLayout dstLayout = ttg::toLinearLayout(convert.getType());
+    Value loadCTAs = getLocalMemoryRecipientCTAs(
+        b, invertAndComposeBlockLocal(srcLayout, dstLayout));
+    return arith::OrIOp::create(b, currentCTAMask(b), loadCTAs);
+  }
+
+  if (auto reduce = dyn_cast<tt::ReduceOp>(op)) {
+    auto srcType = reduce.getInputTypes()[0];
+    if (ttg::getCTASplitNum(srcType.getEncoding())[reduce.getAxis()] != 1)
+      return allCTAsMask(b);
+    return currentCTAMask(b);
+  }
+
+  if (auto broadcastMask = hooks.getScratchCTABroadcastMask(op)) {
+    if (*broadcastMask)
+      return getRecipientCTAsForBroadcastMasks(b, {*broadcastMask});
+  }
+  return currentCTAMask(b);
+}
+
 Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Operation *op) {
   if (auto load = dyn_cast<ttg::LocalLoadOp>(op)) {
     return getLocalLoadStoreRecipientCTAs(b, load.getSrc().getType(),
@@ -721,12 +779,28 @@ public:
       : module(module), hooks(hooks) {}
 
   LogicalResult run() {
-    tti::FunctionBuilder funcBuilder(module, auxData);
-    if (failed(auxData.populateAndPassToWarpSpecialize(module, funcBuilder,
-                                                       hooks)))
+    SmallVector<tt::FuncOp> publicFuncs =
+        llvm::to_vector(llvm::make_filter_range(
+            module.getOps<tt::FuncOp>(),
+            [](tt::FuncOp func) { return func.isPublic(); }));
+    if (publicFuncs.size() != 1) {
+      module.emitError(
+          "ConSan requires exactly one public entrypoint function; "
+          "found ")
+          << publicFuncs.size();
+      return failure();
+    }
+    entryPoint = publicFuncs.front();
+    SmallVector<tt::FuncOp> reachableFunctions;
+    if (failed(collectReachableFunctions(reachableFunctions)) ||
+        failed(validateScratchMetadata(reachableFunctions)) ||
+        failed(validateNonEntryFunctions(reachableFunctions)))
       return failure();
 
-    tt::FuncOp entryPoint = tti::getEntryPoint(module);
+    tti::FunctionBuilder funcBuilder(module, auxData);
+    if (failed(auxData.populateAndPassToWarpSpecialize(module, entryPoint,
+                                                       funcBuilder, hooks)))
+      return failure();
 
     ImplicitLocOpBuilder b(entryPoint.getLoc(), entryPoint);
     b.setInsertionPointToStart(&entryPoint.getBody().front());
@@ -737,12 +811,211 @@ public:
   }
 
 private:
+  LogicalResult
+  collectReachableFunctions(SmallVectorImpl<tt::FuncOp> &reachableFunctions) {
+    if (entryPoint.isExternal()) {
+      entryPoint.emitError("ConSan entrypoint must have a function body");
+      return failure();
+    }
+
+    SymbolTableCollection symbolTable;
+    DenseSet<Operation *> visited;
+    SmallVector<tt::FuncOp> worklist{entryPoint};
+    visited.insert(entryPoint.getOperation());
+
+    while (!worklist.empty()) {
+      tt::FuncOp func = worklist.pop_back_val();
+      reachableFunctions.push_back(func);
+      WalkResult result = func.walk([&](CallOpInterface call) -> WalkResult {
+        Operation *resolved = call.resolveCallableInTable(&symbolTable);
+        tt::FuncOp callee = dyn_cast_or_null<tt::FuncOp>(resolved);
+        if (!callee || callee.isExternal()) {
+          call->emitError("ConSan cannot summarize an unresolved or external "
+                          "callee in function @")
+              << func.getName();
+          return WalkResult::interrupt();
+        }
+        if (visited.insert(callee.getOperation()).second)
+          worklist.push_back(callee);
+        return WalkResult::advance();
+      });
+      if (result.wasInterrupted())
+        return failure();
+    }
+    return success();
+  }
+
+  LogicalResult
+  validateScratchMetadata(ArrayRef<tt::FuncOp> reachableFunctions) {
+    constexpr uint64_t maxSharedMemorySize = uint64_t{1} << 24;
+    for (tt::FuncOp func : reachableFunctions) {
+      WalkResult result = func.walk([&](Operation *op) -> WalkResult {
+        Attribute rawSize = op->getAttr("allocation.size");
+        if (!rawSize)
+          return WalkResult::advance();
+
+        auto size = dyn_cast<IntegerAttr>(rawSize);
+        auto offset =
+            dyn_cast_or_null<IntegerAttr>(op->getAttr("allocation.offset"));
+        if (!size || !offset || !size.getType().isSignlessInteger() ||
+            !offset.getType().isSignlessInteger()) {
+          op->emitError("compiler scratch metadata requires integer "
+                        "allocation.offset and allocation.size attributes");
+          return WalkResult::interrupt();
+        }
+
+        const APInt &offsetValue = offset.getValue();
+        const APInt &sizeValue = size.getValue();
+        bool valid = !offsetValue.isNegative() && !sizeValue.isNegative() &&
+                     !sizeValue.isZero() &&
+                     offsetValue.ule(maxSharedMemorySize) &&
+                     sizeValue.ule(maxSharedMemorySize);
+        if (valid) {
+          uint64_t unsignedOffset = offsetValue.getZExtValue();
+          uint64_t unsignedSize = sizeValue.getZExtValue();
+          valid = unsignedSize <= maxSharedMemorySize - unsignedOffset;
+        }
+        if (!valid) {
+          InFlightDiagnostic diagnostic =
+              op->emitError("invalid compiler scratch allocation metadata: "
+                            "offset ");
+          if (offsetValue.getBitWidth() <= 64)
+            diagnostic << offset.getInt();
+          else
+            diagnostic << offset;
+          diagnostic << ", size ";
+          if (sizeValue.getBitWidth() <= 64)
+            diagnostic << size.getInt();
+          else
+            diagnostic << size;
+          diagnostic << "; the interval must be non-empty and fit in the "
+                        "24-bit shared-memory address space";
+          return WalkResult::interrupt();
+        }
+
+        if (auto info = hooks.getMemEffectsOpInfo(op)) {
+          bool hasSynchronousTracking =
+              info->trackingKind == MemEffectsOpInfo::TrackingKind::None ||
+              info->trackingKind == MemEffectsOpInfo::TrackingKind::Barrier;
+          if (!hasSynchronousTracking || info->implicitCommit) {
+            op->emitError("compiler scratch cannot be combined with "
+                          "asynchronous operation effect tracking");
+            return WalkResult::interrupt();
+          }
+        }
+        return WalkResult::advance();
+      });
+      if (result.wasInterrupted())
+        return failure();
+    }
+    return success();
+  }
+
+  bool isCTALocalScratch(Operation *op) const {
+    if (!op->hasAttr("allocation.size") || ttg::lookupNumCTAs(op) == 1)
+      return true;
+
+    if (auto convert = dyn_cast<ttg::ConvertLayoutOp>(op)) {
+      RankedTensorType srcType = convert.getSrc().getType();
+      RankedTensorType dstType = convert.getType();
+      if (!srcType.getEncoding() || !dstType.getEncoding())
+        return false;
+      StringAttr block = StringAttr::get(op->getContext(), "block");
+      return invertAndComposeBlockLocal(ttg::toLinearLayout(srcType),
+                                        ttg::toLinearLayout(dstType))
+          .isIdentityOnOutDim(block);
+    }
+
+    if (auto reduce = dyn_cast<tt::ReduceOp>(op)) {
+      SmallVector<RankedTensorType> inputs = reduce.getInputTypes();
+      if (inputs.empty() || !inputs.front().getEncoding())
+        return false;
+      SmallVector<unsigned> splits =
+          ttg::getCTASplitNum(inputs.front().getEncoding());
+      unsigned axis = reduce.getAxis();
+      return axis < splits.size() && splits[axis] == 1;
+    }
+
+    return true;
+  }
+
+  // Non-entry bodies are not instrumented. Their compiler-owned shared memory
+  // is covered by the virtual frame on each call, but SSA-visible memory and
+  // sanitizer state transitions cannot be represented by that summary.
+  LogicalResult
+  validateNonEntryFunctions(ArrayRef<tt::FuncOp> reachableFunctions) {
+    AuxDataMap emptyAuxData;
+    for (tt::FuncOp func : reachableFunctions) {
+      if (func == entryPoint)
+        continue;
+      WalkResult result = func.walk([&](Operation *op) -> WalkResult {
+        if (op == func.getOperation() || isa<CallOpInterface>(op))
+          return WalkResult::advance();
+
+        bool hasUnsupportedAllocation =
+            isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(op);
+        bool hasOpaqueEffects =
+            !isa<ttg::BarrierOp>(op) && hasUnknownEffects(op);
+        bool hasUnsupportedResource = false;
+        if (auto memoryEffects = dyn_cast<MemoryEffectOpInterface>(op)) {
+          SmallVector<MemoryEffects::EffectInstance> effects;
+          memoryEffects.getEffects(effects);
+          hasUnsupportedResource = llvm::any_of(
+              effects, [op](const MemoryEffects::EffectInstance &effect) {
+                if (effect.getResource() == tt::GlobalMemory::get())
+                  return false;
+                // Volatile global loads publish a synthetic default-resource
+                // write only to prevent compiler reordering.
+                auto load = dyn_cast<tt::LoadOp>(op);
+                return !(load && load.getIsVolatile() &&
+                         isa<MemoryEffects::Write>(effect.getEffect()) &&
+                         effect.getResource() ==
+                             SideEffects::DefaultResource::get());
+              });
+        }
+
+        auto info = hooks.getMemEffectsOpInfo(op);
+        bool hasMemoryState =
+            info && (!info->operandEffects.empty() || !info->barriers.empty() ||
+                     info->implicitCommit);
+        bool hasBarrierState = hooks.getBarrierInitInfo(op) ||
+                               hooks.getBarrierWaitInfo(op) ||
+                               hooks.getBarrierInvalidateInfo(op) ||
+                               isa<ttg::MBarrierOpInterface>(op);
+        bool hasAsyncState =
+            hooks.getAsyncProxyFenceInfo(op) ||
+            hooks.getWaitOpInfo(op, emptyAuxData) ||
+            op->hasTrait<OpTrait::MemWaitOpTrait>() ||
+            isa<ttg::AsyncCommitGroupOp, ttng::WarpGroupDotWaitOp,
+                ttg::AsyncWaitOp>(op);
+        bool hasControlState =
+            isa<ttg::WarpSpecializeOp, ttg::WarpSpecializePartitionsOp,
+                ttng::ClusterBarrierOp>(op) ||
+            hooks.hasUnsummarizableCalleeState(op);
+        if (!hasUnsupportedAllocation && !hasOpaqueEffects &&
+            !hasUnsupportedResource && !hasMemoryState && !hasBarrierState &&
+            !hasAsyncState && !hasControlState && isCTALocalScratch(op))
+          return WalkResult::advance();
+
+        op->emitError("ConSan cannot summarize ")
+            << op->getName() << " in non-entry function @" << func.getName()
+            << "; inline the function before ConSan or keep its body limited "
+               "to register/global-memory operations and compiler-owned "
+               "shared scratch";
+        return WalkResult::interrupt();
+      });
+      if (result.wasInterrupted())
+        return failure();
+    }
+    return success();
+  }
+
   void initializeAllocations() {
     if (!shouldInitializeAllocations())
       return;
 
     SmallVector<Operation *> allocationsToInitialize;
-    module.walk([&](Operation *op) {
+    entryPoint.walk([&](Operation *op) {
       if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
         if (!alloc.getSrc())
           allocationsToInitialize.push_back(op);
@@ -771,7 +1044,7 @@ private:
   LogicalResult instrumentMemoryOperations(ImplicitLocOpBuilder &b,
                                            tti::FunctionBuilder &funcBuilder) {
     SmallVector<ttng::ClusterBarrierOp> clusterBarriers;
-    WalkResult walkResult = module.walk([&](Operation *op) -> WalkResult {
+    WalkResult walkResult = entryPoint.walk([&](Operation *op) -> WalkResult {
       CriticalSectionListener listener;
       b.setListener(&listener);
 
@@ -914,8 +1187,7 @@ private:
           b.setListener(&listener);
         }
       }
-      if (isa<tt::ReturnOp>(op) && !auxData.activeMasks.empty() &&
-          op->getParentOfType<tt::FuncOp>() == tti::getEntryPoint(module)) {
+      if (isa<tt::ReturnOp>(op) && !auxData.activeMasks.empty()) {
         b.setListener(nullptr);
         Value lock = auxData.lock.at(op).value;
         Value trueVal = arith::ConstantIntOp::create(b, 1, 1);
@@ -987,7 +1259,8 @@ private:
                                      int thread,
                                      tti::FunctionBuilder &funcBuilder) {
     int baseThread = getBaseThread(thread, auxData.threadLayout);
-    std::optional<MemEffectsOpInfo> opInfo = hooks.getMemEffectsOpInfo(op);
+    std::optional<MemEffectsOpInfo> opInfo =
+        getConSanMemEffectsOpInfo(hooks, op);
     if (!opInfo)
       return success();
     Value pred = opInfo->pred;
@@ -1004,29 +1277,42 @@ private:
 
     for (const auto &effect : opInfo->operandEffects) {
       MaterializedEffect materialized;
-      Value buf = effect.buf;
-      auto bufType = cast<ttg::MemDescType>(buf.getType());
-      materialized.memType = MemType::TENSOR_MEM;
-      if (isa<ttg::SharedMemorySpaceAttr>(bufType.getMemorySpace()))
+      if (auto *buf = std::get_if<Value>(&effect.buffer)) {
+        auto bufType = cast<ttg::MemDescType>(buf->getType());
+        materialized.memType = MemType::TENSOR_MEM;
+        if (isa<ttg::SharedMemorySpaceAttr>(bufType.getMemorySpace()))
+          materialized.memType = MemType::SHARED_MEM;
+        auto &candidateMap =
+            auxData.bufferCandidates[static_cast<int>(materialized.memType)];
+        auto candidateIt = candidateMap.find(*buf);
+        if (candidateIt == candidateMap.end()) {
+          op->emitError("missing buffer-region candidates for memdesc");
+          return failure();
+        }
+        Value runtimeBase;
+        if (!candidateIt->second.unknown &&
+            candidateIt->second.cases.size() > 1)
+          runtimeBase = tti::ExperimentalMemDescToI32Op::create(b, *buf);
+        FailureOr<Value> stateMask =
+            createBufferStateMask(b, auxData, materialized.memType, runtimeBase,
+                                  candidateIt->second, op);
+        if (failed(stateMask))
+          return failure();
+        materialized.bufferMask = *stateMask;
+        materialized.effectCTAs =
+            getMemEffectCTAs(b, defaultEffectCTAs, candidateIt->second);
+      } else {
         materialized.memType = MemType::SHARED_MEM;
-      auto &candidateMap =
-          auxData.bufferCandidates[static_cast<int>(materialized.memType)];
-      auto candidateIt = candidateMap.find(buf);
-      if (candidateIt == candidateMap.end()) {
-        op->emitError("missing buffer-region candidates for memdesc");
-        return failure();
+        FailureOr<Value> stateMask = createStaticBufferStateMask(
+            b, auxData,
+            std::get<MemEffectsOpInfo::Effects::StaticSharedBuffer>(
+                effect.buffer),
+            op);
+        if (failed(stateMask))
+          return failure();
+        materialized.bufferMask = *stateMask;
+        materialized.effectCTAs = getScratchEffectCTAs(b, op, hooks);
       }
-      Value runtimeBase;
-      if (!candidateIt->second.unknown && candidateIt->second.cases.size() > 1)
-        runtimeBase = tti::ExperimentalMemDescToI32Op::create(b, buf);
-      FailureOr<Value> stateMask =
-          createBufferStateMask(b, auxData, materialized.memType, runtimeBase,
-                                candidateIt->second, op);
-      if (failed(stateMask))
-        return failure();
-      materialized.bufferMask = *stateMask;
-      materialized.effectCTAs =
-          getMemEffectCTAs(b, defaultEffectCTAs, candidateIt->second);
       materializedEffects.push_back(materialized);
 
       Value bufferMask = materialized.bufferMask;
@@ -1180,6 +1466,7 @@ private:
   }
 
   ModuleOp module;
+  tt::FuncOp entryPoint;
   AuxDataMap auxData;
   const ConSanTargetHooks &hooks;
 };
